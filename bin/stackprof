@@ -7,6 +7,8 @@ Usage: stackprof run [--mode=MODE|--out=FILE|--interval=INTERVAL|--format=FORMAT
 Usage: stackprof [file.dump]+ [--text|--method=NAME|--callgrind|--graphviz]
 END
 
+RubyVM::YJIT.enable
+
 if ARGV.first == "run"
   ARGV.shift
   env = {}

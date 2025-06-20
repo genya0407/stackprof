@@ -1,7 +1,7 @@
 if RUBY_ENGINE == 'truffleruby'
   require "stackprof/truffleruby"
 else
-  require "stackprof/stackprof"
+  require "stackprof"
 end
 
 if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?
