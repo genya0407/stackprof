@@ -1,10 +1,44 @@
 # frozen_string_literal: true
 
 require 'pp'
-require 'digest/md5'
+require 'digest/sha2'
+require 'json'
 
 module StackProf
   class Report
+    MARSHAL_SIGNATURE = "\x04\x08"
+
+    class << self
+      def from_file(file)
+        if (content = IO.binread(file)).start_with?(MARSHAL_SIGNATURE)
+          new(Marshal.load(content))
+        else
+          from_json(JSON.parse(content))
+        end
+      end
+
+      def from_json(json)
+        new(parse_json(json))
+      end
+
+      def parse_json(json)
+        json.keys.each do |key|
+          value = json.delete(key)
+          from_json(value) if value.is_a?(Hash)
+
+          new_key = case key
+          when /\A[0-9]*\z/
+            key.to_i
+          else
+            key.to_sym
+          end
+
+          json[new_key] = value
+        end
+        json
+      end
+    end
+
     def initialize(data)
       @data = data
     end
@@ -18,7 +52,7 @@ module StackProf
     def normalized_frames
       id2hash = {}
       @data[:frames].each do |frame, info|
-        id2hash[frame.to_s] = info[:hash] = Digest::MD5.hexdigest("#{info[:name]}#{info[:file]}#{info[:line]}")
+        id2hash[frame.to_s] = info[:hash] = Digest::SHA256.hexdigest("#{info[:name]}#{info[:file]}#{info[:line]}")
       end
       @data[:frames].inject(Hash.new) do |hash, (frame, info)|
         info = hash[id2hash[frame.to_s]] = info.dup
@@ -191,7 +225,7 @@ module StackProf
           end
         else
           frame = @data[:frames][val]
-          child_name = "#{ frame[:name] } : #{ frame[:file] }"
+          child_name = "#{ frame[:name] } : #{ frame[:file] } : #{ frame[:line] }"
           child_data = convert_to_d3_flame_graph_format(child_name, child_stacks, depth + 1)
           weight += child_data["value"]
           children << child_data
@@ -621,7 +655,8 @@ module StackProf
         samples: d1[:samples] + d2[:samples],
         gc_samples: d1[:gc_samples] + d2[:gc_samples],
         missed_samples: d1[:missed_samples] + d2[:missed_samples],
-        frames: frames
+        frames: d1[:frames].merge(d2[:frames]),
+        raw: d1[:raw].to_a + d2[:raw].to_a,
       }
 
       self.class.new(data)

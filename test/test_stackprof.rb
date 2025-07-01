@@ -4,7 +4,11 @@ require 'minitest/autorun'
 require 'tempfile'
 require 'pathname'
 
-class StackProfTest < MiniTest::Test
+class StackProfTest < Minitest::Test
+  def setup
+    Object.new # warm some caches to avoid flakiness
+  end
+
   def test_info
     profile = StackProf.run{}
     assert_equal 1.2, profile[:version]
@@ -78,12 +82,18 @@ class StackProfTest < MiniTest::Test
     end
 
     assert_operator profile[:samples], :>=, 1
-    offset = RUBY_VERSION >= '3' ? 1 : 0
-    frame = profile[:frames].values[offset]
-    assert_includes frame[:name], "StackProfTest#math"
+    if RUBY_VERSION >= '3'
+      assert profile[:frames].values.take(2).map { |f|
+        f[:name].include? "StackProfTest#math"
+      }.any?
+    else
+      frame = profile[:frames].values.first
+      assert_includes frame[:name], "StackProfTest#math"
+    end
   end
 
   def test_walltime
+    GC.disable
     profile = StackProf.run(mode: :wall) do
       idle
     end
@@ -95,6 +105,8 @@ class StackProfTest < MiniTest::Test
       assert_equal "StackProfTest#idle", frame[:name]
     end
     assert_in_delta 200, frame[:samples], 25
+  ensure
+    GC.enable
   end
 
   def test_custom
@@ -121,19 +133,41 @@ class StackProfTest < MiniTest::Test
   end
 
   def test_raw
+    before_monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC, :microsecond)
+
     profile = StackProf.run(mode: :custom, raw: true) do
       10.times do
         StackProf.sample
+        sleep 0.0001
       end
     end
 
+    after_monotonic = Process.clock_gettime(Process::CLOCK_MONOTONIC, :microsecond)
+
     raw = profile[:raw]
+    raw_lines = profile[:raw_lines]
     assert_equal 10, raw[-1]
     assert_equal raw[0] + 2, raw.size
+    assert_equal 10, raw_lines[-1] # seen 10 times
 
     offset = RUBY_VERSION >= '3' ? -3 : -2
+    assert_equal 140, raw_lines[offset] # sample caller is on 140
     assert_includes profile[:frames][raw[offset]][:name], 'StackProfTest#test_raw'
+
+    assert_equal 10, profile[:raw_sample_timestamps].size
+    profile[:raw_sample_timestamps].each_cons(2) do |t1, t2|
+      assert_operator t1, :>, before_monotonic
+      assert_operator t2, :>=, t1
+      assert_operator t2, :<, after_monotonic
+    end
+
     assert_equal 10, profile[:raw_timestamp_deltas].size
+    total_duration = after_monotonic - before_monotonic
+    assert_operator profile[:raw_timestamp_deltas].inject(&:+), :<, total_duration
+
+    profile[:raw_timestamp_deltas].each do |delta|
+      assert_operator delta, :>, 0
+    end
   end
 
   def test_metadata
@@ -205,7 +239,6 @@ class StackProfTest < MiniTest::Test
       end
     end
 
-    raw = profile[:raw]
     gc_frame = profile[:frames].values.find{ |f| f[:name] == "(garbage collection)" }
     marking_frame = profile[:frames].values.find{ |f| f[:name] == "(marking)" }
     sweeping_frame = profile[:frames].values.find{ |f| f[:name] == "(sweeping)" }
@@ -214,8 +247,12 @@ class StackProfTest < MiniTest::Test
     assert marking_frame
     assert sweeping_frame
 
-    assert_equal gc_frame[:total_samples], profile[:gc_samples]
-    assert_equal profile[:gc_samples], [gc_frame, marking_frame, sweeping_frame].map{|x| x[:samples] }.inject(:+)
+    # We can't guarantee a certain number of GCs to run, so just assert
+    # that it's within some kind of delta
+    assert_in_delta gc_frame[:total_samples], profile[:gc_samples], 2
+
+    # Lazy marking / sweeping can cause this math to not add up, so also use a delta
+    assert_in_delta profile[:gc_samples], [gc_frame, marking_frame, sweeping_frame].map{|x| x[:samples] }.inject(:+), 2
 
     assert_operator profile[:gc_samples], :>, 0
     assert_operator profile[:missed_samples], :<=, 25
@@ -281,4 +318,4 @@ class StackProfTest < MiniTest::Test
     r.close
     w.close
   end
-end
+end unless RUBY_ENGINE == 'truffleruby'

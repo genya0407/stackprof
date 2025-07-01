@@ -2,7 +2,7 @@ $:.unshift File.expand_path('../../lib', __FILE__)
 require 'stackprof'
 require 'minitest/autorun'
 
-class ReportDumpTest < MiniTest::Test
+class ReportDumpTest < Minitest::Test
   require 'stringio'
 
   def test_dump_to_stdout
@@ -30,5 +30,29 @@ class ReportDumpTest < MiniTest::Test
 
   def assert_dump(expected, marshal_data)
     assert_equal expected, Marshal.load(marshal_data)
+  end
+end
+
+class ReportReadTest < Minitest::Test
+  require 'pathname'
+
+  def test_from_file_read_json
+    file = fixture("profile.json")
+    report = StackProf::Report.from_file(file)
+
+    assert_equal({ mode: "cpu" }, report.data)
+  end
+
+  def test_from_file_read_marshal
+    file = fixture("profile.dump")
+    report = StackProf::Report.from_file(file)
+
+    assert_equal({ mode: "cpu" }, report.data)
+  end
+
+  private
+
+  def fixture(name)
+    Pathname.new(__dir__).join("fixtures", name)
   end
 end

@@ -7,10 +7,12 @@
 **********************************************************************/
 
 #include <ruby/ruby.h>
+#include <ruby/version.h>
 #include <ruby/debug.h>
 #include <ruby/st.h>
 #include <ruby/io.h>
 #include <ruby/intern.h>
+#include <ruby/vm.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <time.h>
@@ -24,19 +26,14 @@
 #define FAKE_FRAME_MARK  INT2FIX(1)
 #define FAKE_FRAME_SWEEP INT2FIX(2)
 
-/*
- * As of Ruby 3.0, it should be safe to read stack frames at any time
- * See https://github.com/ruby/ruby/commit/0e276dc458f94d9d79a0f7c7669bde84abe80f21
- */
-#if RUBY_API_VERSION_MAJOR < 3
-  #define USE_POSTPONED_JOB
-#endif
-
 static const char *fake_frame_cstrs[] = {
 	"(garbage collection)",
 	"(marking)",
 	"(sweeping)",
 };
+
+static int stackprof_use_postponed_job = 1;
+static int ruby_vm_running = 0;
 
 #define TOTAL_FAKE_FRAMES (sizeof(fake_frame_cstrs) / sizeof(char *))
 
@@ -58,6 +55,10 @@ static const char *fake_frame_cstrs[] = {
       }
       return result;
   }
+
+  static uint64_t timestamp_usec(timestamp_t *ts) {
+      return (MICROSECONDS_IN_SECOND * ts->tv_sec) + (ts->tv_nsec / 1000);
+  }
 #else
   #define timestamp_t timeval
   typedef struct timestamp_t timestamp_t;
@@ -71,6 +72,10 @@ static const char *fake_frame_cstrs[] = {
       timersub(end, start, &diff);
       return (MICROSECONDS_IN_SECOND * diff.tv_sec) + diff.tv_usec;
   }
+
+  static uint64_t timestamp_usec(timestamp_t *ts) {
+      return (MICROSECONDS_IN_SECOND * ts.tv_sec) + diff.tv_usec
+  }
 #endif
 
 typedef struct {
@@ -80,6 +85,11 @@ typedef struct {
     st_table *edges;
     st_table *lines;
 } frame_data_t;
+
+typedef struct {
+    uint64_t timestamp_usec;
+    int64_t delta_usec;
+} sample_time_t;
 
 static struct {
     int running;
@@ -92,15 +102,15 @@ static struct {
     VALUE metadata;
     int ignore_gc;
 
-    VALUE *raw_samples;
+    uint64_t *raw_samples;
     size_t raw_samples_len;
     size_t raw_samples_capa;
     size_t raw_sample_index;
 
     struct timestamp_t last_sample_at;
-    int *raw_timestamp_deltas;
-    size_t raw_timestamp_deltas_len;
-    size_t raw_timestamp_deltas_capa;
+    sample_time_t *raw_sample_times;
+    size_t raw_sample_times_len;
+    size_t raw_sample_times_capa;
 
     size_t overall_signals;
     size_t overall_samples;
@@ -110,16 +120,23 @@ static struct {
     size_t unrecorded_gc_sweeping_samples;
     st_table *frames;
 
+    timestamp_t gc_start_timestamp;
+
     VALUE fake_frame_names[TOTAL_FAKE_FRAMES];
     VALUE empty_string;
+
+    int buffer_count;
+    sample_time_t buffer_time;
     VALUE frames_buffer[BUF_SIZE];
     int lines_buffer[BUF_SIZE];
+
+    pthread_t target_thread;
 } _stackprof;
 
 static VALUE sym_object, sym_wall, sym_cpu, sym_custom, sym_name, sym_file, sym_line;
 static VALUE sym_samples, sym_total_samples, sym_missed_samples, sym_edges, sym_lines;
-static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_metadata, sym_frames, sym_ignore_gc, sym_out;
-static VALUE sym_aggregate, sym_raw_timestamp_deltas, sym_state, sym_marking, sym_sweeping;
+static VALUE sym_version, sym_mode, sym_interval, sym_raw, sym_raw_lines, sym_metadata, sym_frames, sym_ignore_gc, sym_out;
+static VALUE sym_aggregate, sym_raw_sample_timestamps, sym_raw_timestamp_deltas, sym_state, sym_marking, sym_sweeping;
 static VALUE sym_gc_samples, objtracer;
 static VALUE gc_hook;
 static VALUE rb_mStackProf;
@@ -135,6 +152,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     VALUE opts = Qnil, mode = Qnil, interval = Qnil, metadata = rb_hash_new(), out = Qfalse;
     int ignore_gc = 0;
     int raw = 0, aggregate = 1;
+    VALUE metadata_val;
 
     if (_stackprof.running)
 	return Qfalse;
@@ -149,7 +167,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
 	    ignore_gc = 1;
 	}
 
-	VALUE metadata_val = rb_hash_aref(opts, sym_metadata);
+	metadata_val = rb_hash_aref(opts, sym_metadata);
 	if (RTEST(metadata_val)) {
 	    if (!RB_TYPE_P(metadata_val, T_HASH))
 		rb_raise(rb_eArgError, "metadata should be a hash");
@@ -207,6 +225,7 @@ stackprof_start(int argc, VALUE *argv, VALUE self)
     _stackprof.ignore_gc = ignore_gc;
     _stackprof.metadata = metadata;
     _stackprof.out = out;
+    _stackprof.target_thread = pthread_self();
 
     if (raw) {
 	capture_timestamp(&_stackprof.last_sample_at);
@@ -355,16 +374,25 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 
     if (_stackprof.raw && _stackprof.raw_samples_len) {
 	size_t len, n, o;
-	VALUE raw_timestamp_deltas;
+	VALUE raw_sample_timestamps, raw_timestamp_deltas;
 	VALUE raw_samples = rb_ary_new_capa(_stackprof.raw_samples_len);
+	VALUE raw_lines = rb_ary_new_capa(_stackprof.raw_samples_len);
 
 	for (n = 0; n < _stackprof.raw_samples_len; n++) {
 	    len = (size_t)_stackprof.raw_samples[n];
 	    rb_ary_push(raw_samples, SIZET2NUM(len));
+	    rb_ary_push(raw_lines, SIZET2NUM(len));
 
-	    for (o = 0, n++; o < len; n++, o++)
-		rb_ary_push(raw_samples, PTR2NUM(_stackprof.raw_samples[n]));
+	    for (o = 0, n++; o < len; n++, o++) {
+		// Line is in the upper 16 bits
+		rb_ary_push(raw_lines, INT2NUM(_stackprof.raw_samples[n] >> 48));
+
+		VALUE frame = _stackprof.raw_samples[n] & ~((uint64_t)0xFFFF << 48);
+		rb_ary_push(raw_samples, PTR2NUM(frame));
+	    }
+
 	    rb_ary_push(raw_samples, SIZET2NUM((size_t)_stackprof.raw_samples[n]));
+	    rb_ary_push(raw_lines, SIZET2NUM((size_t)_stackprof.raw_samples[n]));
 	}
 
 	free(_stackprof.raw_samples);
@@ -374,18 +402,22 @@ stackprof_results(int argc, VALUE *argv, VALUE self)
 	_stackprof.raw_sample_index = 0;
 
 	rb_hash_aset(results, sym_raw, raw_samples);
+	rb_hash_aset(results, sym_raw_lines, raw_lines);
 
-	raw_timestamp_deltas = rb_ary_new_capa(_stackprof.raw_timestamp_deltas_len);
+	raw_sample_timestamps = rb_ary_new_capa(_stackprof.raw_sample_times_len);
+	raw_timestamp_deltas = rb_ary_new_capa(_stackprof.raw_sample_times_len);
 
-	for (n = 0; n < _stackprof.raw_timestamp_deltas_len; n++) {
-	    rb_ary_push(raw_timestamp_deltas, INT2FIX(_stackprof.raw_timestamp_deltas[n]));
+	for (n = 0; n < _stackprof.raw_sample_times_len; n++) {
+	    rb_ary_push(raw_sample_timestamps, ULL2NUM(_stackprof.raw_sample_times[n].timestamp_usec));
+	    rb_ary_push(raw_timestamp_deltas, LL2NUM(_stackprof.raw_sample_times[n].delta_usec));
 	}
 
-	free(_stackprof.raw_timestamp_deltas);
-	_stackprof.raw_timestamp_deltas = NULL;
-	_stackprof.raw_timestamp_deltas_len = 0;
-	_stackprof.raw_timestamp_deltas_capa = 0;
+	free(_stackprof.raw_sample_times);
+	_stackprof.raw_sample_times = NULL;
+	_stackprof.raw_sample_times_len = 0;
+	_stackprof.raw_sample_times_capa = 0;
 
+	rb_hash_aset(results, sym_raw_sample_timestamps, raw_sample_timestamps);
 	rb_hash_aset(results, sym_raw_timestamp_deltas, raw_timestamp_deltas);
 
 	_stackprof.raw = 0;
@@ -465,14 +497,14 @@ st_numtable_increment(st_table *table, st_data_t key, size_t increment)
 }
 
 void
-stackprof_record_sample_for_stack(int num, int64_t timestamp_delta)
+stackprof_record_sample_for_stack(int num, uint64_t sample_timestamp, int64_t timestamp_delta)
 {
     int i, n;
     VALUE prev_frame = Qnil;
 
     _stackprof.overall_samples++;
 
-    if (_stackprof.raw) {
+    if (_stackprof.raw && num > 0) {
 	int found = 0;
 
 	/* If there's no sample buffer allocated, then allocate one.  The buffer
@@ -500,7 +532,12 @@ stackprof_record_sample_for_stack(int num, int64_t timestamp_delta)
 	     * in the frames buffer that came from Ruby. */
 	    for (i = num-1, n = 0; i >= 0; i--, n++) {
 		VALUE frame = _stackprof.frames_buffer[i];
-		if (_stackprof.raw_samples[_stackprof.raw_sample_index + 1 + n] != frame)
+		int line = _stackprof.lines_buffer[i];
+
+		// Encode the line in to the upper 16 bits.
+		uint64_t key = ((uint64_t)line << 48) | (uint64_t)frame;
+
+		if (_stackprof.raw_samples[_stackprof.raw_sample_index + 1 + n] != key)
 		    break;
 	    }
 	    if (i == -1) {
@@ -518,27 +555,34 @@ stackprof_record_sample_for_stack(int num, int64_t timestamp_delta)
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)num;
 	    for (i = num-1; i >= 0; i--) {
 		VALUE frame = _stackprof.frames_buffer[i];
-		_stackprof.raw_samples[_stackprof.raw_samples_len++] = frame;
+		int line = _stackprof.lines_buffer[i];
+
+		// Encode the line in to the upper 16 bits.
+		uint64_t key = ((uint64_t)line << 48) | (uint64_t)frame;
+
+		_stackprof.raw_samples[_stackprof.raw_samples_len++] = key;
 	    }
 	    _stackprof.raw_samples[_stackprof.raw_samples_len++] = (VALUE)1;
 	}
 
 	/* If there's no timestamp delta buffer, allocate one */
-	if (!_stackprof.raw_timestamp_deltas) {
-	    _stackprof.raw_timestamp_deltas_capa = 100;
-	    _stackprof.raw_timestamp_deltas = malloc(sizeof(int) * _stackprof.raw_timestamp_deltas_capa);
-	    _stackprof.raw_timestamp_deltas_len = 0;
+	if (!_stackprof.raw_sample_times) {
+	    _stackprof.raw_sample_times_capa = 100;
+	    _stackprof.raw_sample_times = malloc(sizeof(sample_time_t) * _stackprof.raw_sample_times_capa);
+	    _stackprof.raw_sample_times_len = 0;
 	}
 
 	/* Double the buffer size if it's too small */
-	while (_stackprof.raw_timestamp_deltas_capa <= _stackprof.raw_timestamp_deltas_len + 1) {
-	    _stackprof.raw_timestamp_deltas_capa *= 2;
-	    _stackprof.raw_timestamp_deltas = realloc(_stackprof.raw_timestamp_deltas, sizeof(int) * _stackprof.raw_timestamp_deltas_capa);
+	while (_stackprof.raw_sample_times_capa <= _stackprof.raw_sample_times_len + 1) {
+	    _stackprof.raw_sample_times_capa *= 2;
+	    _stackprof.raw_sample_times = realloc(_stackprof.raw_sample_times, sizeof(sample_time_t) * _stackprof.raw_sample_times_capa);
 	}
 
-	/* Store the time delta (which is the amount of microseconds between samples).
-	 * Since the sampling interval can't be more than a second, this should be safe to cast. */
-	_stackprof.raw_timestamp_deltas[_stackprof.raw_timestamp_deltas_len++] = (int) timestamp_delta;
+	/* Store the time delta (which is the amount of microseconds between samples). */
+	_stackprof.raw_sample_times[_stackprof.raw_sample_times_len++] = (sample_time_t) {
+	    .timestamp_usec = sample_timestamp,
+	    .delta_usec = timestamp_delta,
+        };
     }
 
     for (i = 0; i < num; i++) {
@@ -575,37 +619,53 @@ stackprof_record_sample_for_stack(int num, int64_t timestamp_delta)
     }
 }
 
+// buffer the current profile frames
+// This must be async-signal-safe
+// Returns immediately if another set of frames are already in the buffer
 void
-stackprof_record_sample()
+stackprof_buffer_sample(void)
 {
+    uint64_t start_timestamp = 0;
     int64_t timestamp_delta = 0;
     int num;
+
+    if (_stackprof.buffer_count > 0) {
+	// Another sample is already pending
+	return;
+    }
+
     if (_stackprof.raw) {
 	struct timestamp_t t;
 	capture_timestamp(&t);
-	timestamp_delta = delta_usec(&t, &_stackprof.last_sample_at);
+	start_timestamp = timestamp_usec(&t);
+	timestamp_delta = delta_usec(&_stackprof.last_sample_at, &t);
     }
+
     num = rb_profile_frames(0, sizeof(_stackprof.frames_buffer) / sizeof(VALUE), _stackprof.frames_buffer, _stackprof.lines_buffer);
-    stackprof_record_sample_for_stack(num, timestamp_delta);
+
+    _stackprof.buffer_count = num;
+    _stackprof.buffer_time.timestamp_usec = start_timestamp;
+    _stackprof.buffer_time.delta_usec = timestamp_delta;
 }
 
+// Postponed job
 void
-stackprof_record_gc_samples()
+stackprof_record_gc_samples(void)
 {
     int64_t delta_to_first_unrecorded_gc_sample = 0;
+    uint64_t start_timestamp = 0;
     size_t i;
     if (_stackprof.raw) {
-	struct timestamp_t t;
-	capture_timestamp(&t);
+	struct timestamp_t t = _stackprof.gc_start_timestamp;
+	start_timestamp = timestamp_usec(&t);
 
 	// We don't know when the GC samples were actually marked, so let's
 	// assume that they were marked at a perfectly regular interval.
-	delta_to_first_unrecorded_gc_sample = delta_usec(&t, &_stackprof.last_sample_at) - (_stackprof.unrecorded_gc_samples - 1) * NUM2LONG(_stackprof.interval);
+	delta_to_first_unrecorded_gc_sample = delta_usec(&_stackprof.last_sample_at, &t) - (_stackprof.unrecorded_gc_samples - 1) * NUM2LONG(_stackprof.interval);
 	if (delta_to_first_unrecorded_gc_sample < 0) {
 	    delta_to_first_unrecorded_gc_sample = 0;
 	}
     }
-
 
     for (i = 0; i < _stackprof.unrecorded_gc_samples; i++) {
 	int64_t timestamp_delta = i == 0 ? delta_to_first_unrecorded_gc_sample : NUM2LONG(_stackprof.interval);
@@ -617,7 +677,7 @@ stackprof_record_gc_samples()
         _stackprof.lines_buffer[1] = 0;
         _stackprof.unrecorded_gc_marking_samples--;
 
-        stackprof_record_sample_for_stack(2, timestamp_delta);
+        stackprof_record_sample_for_stack(2, start_timestamp, timestamp_delta);
       } else if (_stackprof.unrecorded_gc_sweeping_samples) {
         _stackprof.frames_buffer[0] = FAKE_FRAME_SWEEP;
         _stackprof.lines_buffer[0] = 0;
@@ -626,11 +686,11 @@ stackprof_record_gc_samples()
 
         _stackprof.unrecorded_gc_sweeping_samples--;
 
-        stackprof_record_sample_for_stack(2, timestamp_delta);
+        stackprof_record_sample_for_stack(2, start_timestamp, timestamp_delta);
       } else {
         _stackprof.frames_buffer[0] = FAKE_FRAME_GC;
         _stackprof.lines_buffer[0] = 0;
-        stackprof_record_sample_for_stack(1, timestamp_delta);
+        stackprof_record_sample_for_stack(1, start_timestamp, timestamp_delta);
       }
     }
     _stackprof.during_gc += _stackprof.unrecorded_gc_samples;
@@ -639,8 +699,25 @@ stackprof_record_gc_samples()
     _stackprof.unrecorded_gc_sweeping_samples = 0;
 }
 
+// record the sample previously buffered by stackprof_buffer_sample
 static void
-stackprof_gc_job_handler(void *data)
+stackprof_record_buffer(void)
+{
+    stackprof_record_sample_for_stack(_stackprof.buffer_count, _stackprof.buffer_time.timestamp_usec, _stackprof.buffer_time.delta_usec);
+
+    // reset the buffer
+    _stackprof.buffer_count = 0;
+}
+
+static void
+stackprof_sample_and_record(void)
+{
+    stackprof_buffer_sample();
+    stackprof_record_buffer();
+}
+
+static void
+stackprof_job_record_gc(void *data)
 {
     if (!_stackprof.running) return;
 
@@ -648,11 +725,19 @@ stackprof_gc_job_handler(void *data)
 }
 
 static void
-stackprof_job_handler(void *data)
+stackprof_job_sample_and_record(void *data)
 {
     if (!_stackprof.running) return;
 
-    stackprof_record_sample();
+    stackprof_sample_and_record();
+}
+
+static void
+stackprof_job_record_buffer(void *data)
+{
+    if (!_stackprof.running) return;
+
+    stackprof_record_buffer();
 }
 
 static void
@@ -663,7 +748,27 @@ stackprof_signal_handler(int sig, siginfo_t *sinfo, void *ucontext)
     _stackprof.overall_signals++;
 
     if (!_stackprof.running) return;
-    if (!ruby_native_thread_p()) return;
+
+    // There's a possibility that the signal handler is invoked *after* the Ruby
+    // VM has been shut down (e.g. after ruby_cleanup(0)). In this case, things
+    // that rely on global VM state (e.g. rb_during_gc) will segfault.
+    if (!ruby_vm_running) return;
+
+    if (_stackprof.mode == sym_wall) {
+        // In "wall" mode, the SIGALRM signal will arrive at an arbitrary thread.
+        // In order to provide more useful results, especially under threaded web
+        // servers, we want to forward this signal to the original thread
+        // StackProf was started from.
+        // According to POSIX.1-2008 TC1 pthread_kill and pthread_self should be
+        // async-signal-safe.
+        if (pthread_self() != _stackprof.target_thread) {
+            pthread_kill(_stackprof.target_thread, sig);
+            return;
+        }
+    } else {
+        if (!ruby_native_thread_p()) return;
+    }
+
     if (pthread_mutex_trylock(&lock)) return;
 
     if (!_stackprof.ignore_gc && rb_during_gc()) {
@@ -673,14 +778,22 @@ stackprof_signal_handler(int sig, siginfo_t *sinfo, void *ucontext)
 	} else if (mode == sym_sweeping) {
 	    _stackprof.unrecorded_gc_sweeping_samples++;
 	}
+	if(!_stackprof.unrecorded_gc_samples) {
+	    // record start
+	    capture_timestamp(&_stackprof.gc_start_timestamp);
+	}
 	_stackprof.unrecorded_gc_samples++;
-	rb_postponed_job_register_one(0, stackprof_gc_job_handler, (void*)0);
+	rb_postponed_job_register_one(0, stackprof_job_record_gc, (void*)0);
     } else {
-#ifdef USE_POSTPONED_JOB
-	rb_postponed_job_register_one(0, stackprof_job_handler, (void*)0);
-#else
-	stackprof_job_handler(0);
-#endif
+        if (stackprof_use_postponed_job) {
+            rb_postponed_job_register_one(0, stackprof_job_sample_and_record, (void*)0);
+        } else {
+            // Buffer a sample immediately, if an existing sample exists this will
+            // return immediately
+            stackprof_buffer_sample();
+            // Enqueue a job to record the sample
+            rb_postponed_job_register_one(0, stackprof_job_record_buffer, (void*)0);
+        }
     }
     pthread_mutex_unlock(&lock);
 }
@@ -691,7 +804,7 @@ stackprof_newobj_handler(VALUE tpval, void *data)
     _stackprof.overall_signals++;
     if (RTEST(_stackprof.interval) && _stackprof.overall_signals % NUM2LONG(_stackprof.interval))
 	return;
-    stackprof_job_handler(0);
+    stackprof_sample_and_record();
 }
 
 static VALUE
@@ -701,7 +814,7 @@ stackprof_sample(VALUE self)
 	return Qfalse;
 
     _stackprof.overall_signals++;
-    stackprof_job_handler(0);
+    stackprof_sample_and_record();
     return Qtrue;
 }
 
@@ -724,6 +837,17 @@ stackprof_gc_mark(void *data)
 
     if (_stackprof.frames)
 	st_foreach(_stackprof.frames, frame_mark_i, 0);
+
+    int i;
+    for (i = 0; i < _stackprof.buffer_count; i++) {
+        rb_gc_mark(_stackprof.frames_buffer[i]);
+    }
+}
+
+static size_t
+stackprof_memsize(const void *data)
+{
+    return sizeof(_stackprof);
 }
 
 static void
@@ -758,10 +882,41 @@ stackprof_atfork_child(void)
     stackprof_stop(rb_mStackProf);
 }
 
+static VALUE
+stackprof_use_postponed_job_l(VALUE self)
+{
+    stackprof_use_postponed_job = 1;
+    return Qnil;
+}
+
+static void
+stackprof_at_exit(ruby_vm_t* vm)
+{
+    ruby_vm_running = 0;
+}
+
+static const rb_data_type_t stackprof_type = {
+    "StackProf",
+    {
+        stackprof_gc_mark,
+        NULL,
+        stackprof_memsize,
+    }
+};
+
 void
 Init_stackprof(void)
 {
     size_t i;
+   /*
+    * As of Ruby 3.0, it should be safe to read stack frames at any time, unless YJIT is enabled
+    * See https://github.com/ruby/ruby/commit/0e276dc458f94d9d79a0f7c7669bde84abe80f21
+    */
+    stackprof_use_postponed_job = RUBY_API_VERSION_MAJOR < 3;
+
+    ruby_vm_running = 1;
+    ruby_vm_at_exit(stackprof_at_exit);
+
 #define S(name) sym_##name = ID2SYM(rb_intern(#name));
     S(object);
     S(custom);
@@ -780,6 +935,8 @@ Init_stackprof(void)
     S(mode);
     S(interval);
     S(raw);
+    S(raw_lines);
+    S(raw_sample_timestamps);
     S(raw_timestamp_deltas);
     S(out);
     S(metadata);
@@ -794,17 +951,17 @@ Init_stackprof(void)
     /* Need to run this to warm the symbol table before we call this during GC */
     rb_gc_latest_gc_info(sym_state);
 
-    gc_hook = Data_Wrap_Struct(rb_cObject, stackprof_gc_mark, NULL, &_stackprof);
     rb_global_variable(&gc_hook);
+    gc_hook = TypedData_Wrap_Struct(rb_cObject, &stackprof_type, &_stackprof);
 
     _stackprof.raw_samples = NULL;
     _stackprof.raw_samples_len = 0;
     _stackprof.raw_samples_capa = 0;
     _stackprof.raw_sample_index = 0;
 
-    _stackprof.raw_timestamp_deltas = NULL;
-    _stackprof.raw_timestamp_deltas_len = 0;
-    _stackprof.raw_timestamp_deltas_capa = 0;
+    _stackprof.raw_sample_times = NULL;
+    _stackprof.raw_sample_times_len = 0;
+    _stackprof.raw_sample_times_capa = 0;
 
     _stackprof.empty_string = rb_str_new_cstr("");
     rb_global_variable(&_stackprof.empty_string);
@@ -821,6 +978,7 @@ Init_stackprof(void)
     rb_define_singleton_method(rb_mStackProf, "stop", stackprof_stop, 0);
     rb_define_singleton_method(rb_mStackProf, "results", stackprof_results, -1);
     rb_define_singleton_method(rb_mStackProf, "sample", stackprof_sample, 0);
+    rb_define_singleton_method(rb_mStackProf, "use_postponed_job!", stackprof_use_postponed_job_l, 0);
 
     pthread_atfork(stackprof_atfork_prepare, stackprof_atfork_parent, stackprof_atfork_child);
 }
